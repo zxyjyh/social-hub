@@ -1,0 +1,16 @@
+{
+  "name": "social-hub",
+  "version": "0.1.0",
+  "description": "可插拔的公域账号中枢：一次授权，多平台发布、评论托管与数据回流",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
