@@ -21,7 +21,7 @@
 
 - 三个平台适配器：Facebook Page、Instagram Business、Google Business Profile
 - OAuth 授权、凭证加密存储、按平台分叉的 token 刷新
-- 内容生成层：门店/团单 → 图文（繁中 + 英文两版）
+- 内容生成层：门店/团单 → 图文（v1 单语言简体中文）
 - 发布链路：校验 → 平台裁剪 → 发布 → 回查确认
 - 评论托管：拉取评论 → AI 起草 → **人工确认** → 发出
 - 数据回流：账号级与帖子级指标
@@ -39,7 +39,7 @@
 
 - Webhook 接收评论（先轮询）
 - 接澳觅真实门店/团单 API（先 mock）
-- 多于繁中 + 英文的语言
+- 多语言（v1 只出简体中文，见 §3.1）
 
 ## 3. 已确认的约束
 
@@ -49,18 +49,26 @@
 | 2 | 门店/团单先 mock，留可替换 `DataSource` | 以后接澳觅 API 只换实现 |
 | 3 | 视频调澳觅服务；文案与图片本项目自己接模型 | `AOMI_AI_VIDEO_BASE_URL` 只管视频 |
 | 4 | 存储用 SQLite，零运维 | token 加密落盘，重启不丢 |
-| 5 | 简体中文 = 后台界面与代码注释；发出去的文案用繁中 + 英文 | 见 §3.1 |
+| 5 | 简体中文 = 后台界面、代码注释、v1 发文语言 | 见 §3.1 |
 | 6 | 后台要做，极简单页 | Hono 同时出 REST 与静态页 |
 | 7 | 不等 Google 审批，适配器按接口写全接 mock | 配额批下来只换 Transport |
 | 8 | Graph API 起步版本 v26.0 | 见 §4 |
 
-### 3.1 语言决策的依据
+### 3.1 语言决策
 
-发文语言定为繁中 + 英文，而非简体中文。理由：Facebook 与 Instagram 在内地不可用，
-Google Maps 内地客基本不用——简中在这三个平台上没有对应读者群。
-澳门本地与港台读繁中，国际客读英文，覆盖 PLAN.md 认定的那 27%（1094 万人次）入境客群。
+**v1 只出简体中文**，多语言留到后续版本。这是明确的产品决定。
 
-简体中文用于后台界面与代码注释。
+需要记录的取舍：设计评审时曾建议改为繁中 + 英文，理由是 Facebook 与 Instagram
+在内地不可用、Google Maps 内地客基本不用，简中在这三个平台上缺少对应读者群；
+而 PLAN.md 认定的目标客群是那 27%（1094 万人次）港台与国际入境客，他们读繁中与英文。
+该建议未被采纳，v1 按简中实现。
+
+因此产生的两点影响，实现时不要忽略：
+
+1. 演示脚本第 3 步「有多语言就同时出两版」在 v1 不成立，只出一版
+2. Google `localPost` 的 `languageCode` 是必填字段，v1 传 `zh-CN`
+
+后续要加语言时的扩展路径见 §6.5。
 
 ## 4. 已核验的外部事实
 
@@ -141,7 +149,7 @@ src/
 `ContentGenerator` 吃 `Store + Deal`，产出中性素材包 `ContentDraft`；
 各平台适配器用一个**纯函数** `format(draft) → PublishTask` 做裁剪。
 
-- 提示词只有一套，模型只调一次，同时出繁中与英文
+- 提示词只有一套，模型只调一次；加语言时也只是多调几次，不动平台层
 - 新增平台 = 三个接口 + 一个纯函数（无 IO，易测），README 的「接一个新平台 = 实现三个接口」基本保住
 - Google 的 `offer.couponCode` / `languageCode` 等结构化字段有确定落点
 
@@ -228,13 +236,14 @@ Facebook Page token `refreshable: false`；Instagram 与 User token 提前 7 天
 生成层的产物，与任何平台无关。各平台的 `format()` 从中取用自己需要的部分。
 
 ```ts
-export type Lang = 'zh-Hant' | 'en'
-
 export interface ContentDraft {
   storeId: string
   dealId?: string
-  /** 两种语言各一版；键为 languageCode，直接可喂给 Google 的 localPost */
-  body: Record<Lang, { headline: string; text: string }>
+  /** v1 恒为 'zh-CN'。Google localPost 的必填字段，一路透传 */
+  languageCode: string
+  headline: string
+  /** 生成时按最长平台（Facebook）产出，短平台在 format() 里截断 */
+  text: string
   imageUrls: string[]
   videoUrl?: string
   /** 外链号召，Google 有原生字段，FB/IG 拼进正文 */
@@ -248,9 +257,14 @@ export interface ContentDraft {
 
 | 平台 | 取用 |
 |---|---|
-| Facebook | 长文案，`callToAction` 拼进正文尾部，图片多张 |
-| Instagram | 短文案 + 话题标签，必须有图或视频，`callToAction` 只能进正文 |
-| Google | `headline` → summary，原生 `languageCode` 每语言各发一条，原生 `offer` 与 `callToAction` |
+| Facebook | 全量 `text`，`callToAction` 拼进正文尾部，图片多张 |
+| Instagram | 截断 `text` + 话题标签，必须有图或视频，`callToAction` 只能进正文 |
+| Google | `headline` → summary，`languageCode` 原生透传，原生 `offer` 与 `callToAction` |
+
+**加语言时的扩展路径**：`ContentDraft` 保持单语言不变，改为一次生成返回
+`ContentDraft[]`（每语言一份），发布层对每份独立走一遍现有链路。
+Google 侧本就是每语言一条 `localPost`，天然对齐；FB/IG 需要产品上先决定
+是发多条还是只发一条主语言。v1 不预留这个分支。
 
 ### 6.6 适配器完整形态
 
@@ -268,7 +282,7 @@ export interface PlatformAdapter extends PlatformAuth, PlatformPublish, Platform
 
 ```
 MockDataSource → Store + Deal
-      ↓ ContentGenerator（文案繁中/英；图片；视频调澳觅服务）
+      ↓ ContentGenerator（文案简中；图片；视频调澳觅服务）
    ContentDraft
       ↓ adapter.format(draft)          纯函数，按平台裁剪
    PublishTask
