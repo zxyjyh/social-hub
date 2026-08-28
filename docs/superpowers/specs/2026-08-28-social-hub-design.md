@@ -109,6 +109,15 @@ Google 侧数据回流走这个接口。
 **Instagram 回复评论可用**：`POST /<IG_COMMENT_ID>/replies`，
 权限名 `instagram_business_manage_comments` 正确。
 
+**Instagram feed 正文的链接不可点。** 这是产品设计而非 API 限制。
+2026-03 起 Meta 在测试正文可点链接，但仅限订阅 Meta Verified 的专业创作者账号、
+每月上限 10 条，不能作为方案基础。IG 的可用外链出口只有 bio 链接（2026 年上限 5 条）
+与 Stories 的 link sticker。归因影响见 §9.3。
+
+**Business Profile Performance API v1 提供到店转化级指标**：
+`BUSINESS_FOOD_ORDERS`、`BUSINESS_DIRECTION_REQUESTS`、`BUSINESS_BOOKINGS`、
+`CALL_CLICKS`、`WEBSITE_CLICKS` 等，按 location 日度聚合。详见 §9.3。
+
 ### 补充差异
 
 Google `topicType` 官方枚举含 `ALERT`，仓库 README 只列了 STANDARD / EVENT / OFFER。
@@ -304,22 +313,114 @@ MockDataSource → Store + Deal
 SQLite（better-sqlite3）。选它而非 Postgres 是为零运维；
 Node 22 内置的 `node:sqlite` 仍为 experimental，不采用。
 
+- `stores` —— 澳觅门店 ↔ 平台发布目标的显式映射：`(aomiStoreId, platform, targetId, targetName)`
 - `credentials` —— 凭证，`accessToken` / `refreshToken` 用 `CREDENTIAL_ENCRYPTION_KEY` 加密后存
 - `drafts` —— 生成的素材包
-- `posts` —— 发布记录：平台、postId、permalink、状态、发布时间
+- `posts` —— 发布记录：`bizId`、`dealId`、平台、postId、permalink、`trackToken`、状态、发布时间
 - `comments` —— 拉回的评论及其回复状态
 - `reply_drafts` —— AI 起草的回复，状态 `pending` / `approved` / `sent`
+- `attribution` —— `trackToken` → 点击时间、澳觅订单 ID（订单 ID 需澳觅侧回写，见 §9.4）
+
+`stores` 表是新增的。原设计靠 `Credential.bizId` 隐含表达这层映射，
+但 `bizId` 语义模糊——它既可能是 `'AOMI_SELF'`，也可能是某个门店 ID。
+归因链路要按门店聚合，这层映射必须显式化。
 
 `CredentialStore` 接口保持不变，仅替换实现——现有的 `InMemoryCredentialStore` 保留供测试使用。
 
-## 9. 错误处理与重试
+## 9. 与澳觅的数据关联
+
+打通分两个方向，难度差一个数量级：出站是工程问题，回流关联被平台能力卡住。
+
+### 9.1 出站：关联键已在契约里
+
+`Credential` 的 `bizId` ↔ `targetId` 就是「澳觅门店 ↔ 平台发布目标」的映射——
+一条授权记录同时记住了这是澳觅的哪家店、对应平台上的哪个 pageId / igUserId / locationId。
+不需要新增机制，只需 `DataSource` 从澳觅拉 `Store` 与 `Deal`。
+
+### 9.2 `DataSource` 有两个用途
+
+原设计只写了「供内容生成取数」，漏了第二个：**评论托管起草回复时要读澳觅的实时数据**。
+评论问「几点打烊」「还有位吗」，AI 起草需要门店营业时间与团单库存。
+`DataSource` 接口要同时满足这两类读取。
+
+### 9.3 回流：四个层次，可靠性递减
+
+**第 1 层 · 帖子级归属（100% 可靠，零平台依赖）**
+
+`posts` 表存 `(bizId, dealId, platform, postId)`，平台按 `postId` 返回指标与评论，本地 join。
+能回答「哪家店、哪个团单的帖子曝光多少」，回答不了「带来多少生意」。
+
+**第 2 层 · 点击归因（唯一能连到成交的链路）**
+
+落地链接挂唯一 token：`https://<澳觅域名>/deal/{dealId}?s={trackToken}`。
+落地页把 token 写进 session，下单时带上，澳觅订单表多一个来源字段。
+
+三个平台的外链能力差异是硬约束：
+
+| 平台 | 外链可点 | 说明 |
+|---|---|---|
+| Google | ✅ | `callToAction` 原生字段 |
+| Facebook | ✅ | 帖子可带链接 |
+| Instagram | ❌ | feed 正文链接不可点 |
+
+Instagram 这条是**产品设计而非 API 限制**。2026-03 起 Meta 在测试正文可点链接，
+但仅限订阅 Meta Verified 的专业创作者账号且每月上限 10 条，不能作为方案基础。
+IG 的可用出口只有 bio 链接（2026 年上限 5 条）与 Stories 的 link sticker。
+
+**结论：Instagram 只能做到帖子级曝光与互动，做不到点击归因。**
+这属于「能力边界要主动说清楚」的同类，演示时应主动说明。
+
+**第 3 层 · Google 原生转化指标（最强的一层）**
+
+Business Profile Performance API v1 的 `DailyMetric` 枚举：
+
+```
+BUSINESS_FOOD_ORDERS          从 Business Profile 产生的餐饮订单数
+BUSINESS_FOOD_MENU_CLICKS     菜单点击（按用户按天去重）
+BUSINESS_DIRECTION_REQUESTS   导航请求，到店意图
+BUSINESS_BOOKINGS             预订数（Reserve with Google）
+BUSINESS_CONVERSATIONS        消息会话数
+CALL_CLICKS                   拨号按钮点击
+WEBSITE_CLICKS                网站点击
+BUSINESS_IMPRESSIONS_DESKTOP_MAPS / _DESKTOP_SEARCH
+BUSINESS_IMPRESSIONS_MOBILE_MAPS / _MOBILE_SEARCH
+```
+
+这些指标是 **per-location** 的，而 location 与澳觅门店本就一一对应——
+Google 侧不需要自建归因，它原生给出「这家店从 Google 带来多少订单、多少导航请求」。
+`BUSINESS_FOOD_ORDERS` 对澳觅的业务形态直接对口。
+
+这改变了 Google 在方案中的位置：它不只是「第二个接进来的平台」，
+而是**唯一能自己给出到店转化数据的平台**。等配额的优先级因此高于原判断。
+
+限制：location 级**日度聚合**，非 post 级。只能做「发帖前后对比」的准实验，
+不能精确归因到单条帖子。
+
+**第 4 层 · Meta Conversions API（v1 明确不做）**
+
+把澳觅下单事件回传 Meta。不做的两个理由：CAPI 是为广告投放优化设计的，
+organic 帖子的归因很弱；且需上传哈希后的手机号 / 邮箱等 PII，
+澳觅是持牌平台，这是合规决策而非技术决策，不由本设计代为决定。
+
+### 9.4 需要澳觅侧配合的三件事
+
+第 2 层依赖以下三项，缺一则断：
+
+1. 落地页能接住 `?s={token}` 并写入 session
+2. **订单表增加来源字段**——动的是交易主链路，大概率需跨团队排期
+3. 门店 / 团单只读 API
+
+若第 2 条排不进去，第 2 层只能停在点击数、连不到成交，
+届时 Google 的第 3 层就是唯一的转化证据。
+
+## 10. 错误处理与重试
 
 `PublishError.retryable` 维持现有分级：429 与 5xx 可重试，其余不可。
 
 `publishing/pipeline.ts` 实现指数退避，最多 3 次。不可重试错误立即失败并落库，
 便于后台展示失败原因。
 
-## 10. 测试策略
+## 11. 测试策略
 
 每个平台的 HTTP 调用封装在 `Transport` 接口后，测试注入假 Transport，
 **三个适配器全部可离线单测，不需要真实 token**。
@@ -333,7 +434,7 @@ Google 适配器就用这个机制接 mock，配额批下来后只换 Transport 
 - IG 容器轮询状态机——就绪、未就绪、超时、失败四种走向
 - token 刷新分叉——Page token 不刷新、IG token 到期前刷新
 
-## 11. 从 AiToEarn 的借鉴与取舍
+## 12. 从 AiToEarn 的借鉴与取舍
 
 参照 [AiToEarn](https://github.com/yikart/AiToEarn)（MIT，25.4k stars）。
 抄的是分层方式与 API 调用序列，不是代码。
@@ -362,7 +463,7 @@ AiToEarn 有 `google-business` 目录，但其中只有 auth provider，没有 p
 一个 13 平台、25k star 的项目在 Google Business 上也只做到授权就停了——
 这佐证了配额审批是这条路上对所有人生效的阻塞，不是申请方式的问题。
 
-## 12. 已知风险
+## 13. 已知风险
 
 | 风险 | 应对 |
 |---|---|
@@ -371,8 +472,10 @@ AiToEarn 有 `google-business` 目录，但其中只有 auth provider，没有 p
 | IG token 60 天过期，供稿期中断 | 凭证健康检查定时任务，提前 7 天刷新 |
 | Meta 指标口径 2026-06 已变更 | 数据回流层按 Media Views 体系实现，不用已下线的 impressions |
 | 商家可能没有痛点（PLAN.md 验证清单未跑） | 该清单仍待执行；结论若为「商家更新得挺勤」则需换题 |
+| Instagram 无法做点击归因（feed 正文链接不可点） | 接受为能力边界，演示时主动说明；IG 只报曝光与互动 |
+| 澳觅订单表来源字段排不进期 | 第 2 层归因停在点击数；Google 的第 3 层成为唯一转化证据 |
 
-## 13. 待办
+## 14. 待办
 
 PLAN.md 的开工前验证清单尚未执行，其中四条需要本项目之外的信息：
 
